@@ -9,6 +9,7 @@ import logging
 from contextlib import suppress
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -232,6 +233,98 @@ def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
     return _git_ok(git_cmd, ["push", "origin", "main", "--force-with-lease"], cwd, network=True)
 
 
+def _configured_fork_sync_strategy() -> str:
+    """Return the opt-in fork sync strategy; unknown values fail closed to preserve."""
+    try:
+        from hermes_cli.update_cmd import _updates_config
+        configured = str(_updates_config().get("fork_sync_strategy", "preserve")).strip().lower()
+    except Exception as exc:
+        logger.debug("Could not read updates.fork_sync_strategy: %s", exc)
+        return "preserve"
+    return "rebase" if configured == "rebase" else "preserve"
+
+
+def _git_failure_detail(result: subprocess.CompletedProcess) -> str:
+    detail = ((result.stderr or "") + "\n" + (result.stdout or "")).strip()
+    return detail.splitlines()[0] if detail else "git command failed"
+
+
+def _rebase_fork_main_onto_upstream(git_cmd: list[str], cwd: Path) -> None:
+    """Rebase ``origin/main`` off-checkout, then update it with an exact lease.
+
+    The live checkout does not move until the caller's normal pull phase. A conflict or
+    rejected lease therefore leaves both it and the remote fork byte-for-byte unchanged.
+    ``--rebase-merges`` preserves a personal main assembled from focused patch branches.
+    """
+    from hermes_cli.update_cmd import _git_run
+
+    origin_head = _git_stdout(git_cmd, ["rev-parse", "origin/main"], cwd)
+    if not origin_head:
+        print("✗ Could not resolve origin/main before rebasing the fork.")
+        raise SystemExit(1)
+
+    print("\n→ Rebasing personal fork commits onto upstream/main in an isolated worktree...")
+    with tempfile.TemporaryDirectory(prefix="hermes-fork-rebase-") as temp_root:
+        checkout = Path(temp_root) / "checkout"
+        added = _git_run(
+            git_cmd, ["worktree", "add", "--detach", str(checkout), "origin/main"], cwd
+        )
+        if added.returncode != 0:
+            print(f"✗ Could not create the isolated rebase worktree: {_git_failure_detail(added)}")
+            raise SystemExit(1)
+        try:
+            rebased = _git_run(
+                git_cmd,
+                [
+                    "-c", "core.editor=true", "-c", "sequence.editor=true",
+                    "rebase", "--rebase-merges", "upstream/main",
+                ],
+                checkout,
+            )
+            if rebased.returncode != 0:
+                print(f"✗ Personal fork commits conflict with upstream: {_git_failure_detail(rebased)}")
+                print("  The live checkout and remote fork were not changed.")
+                raise SystemExit(1)
+
+            rebased_head = _git_stdout(git_cmd, ["rev-parse", "HEAD"], checkout)
+            if not rebased_head:
+                print("✗ Could not resolve the rebased fork head; nothing was pushed.")
+                raise SystemExit(1)
+            pushed = _git_run(
+                git_cmd,
+                [
+                    "push", "origin", f"{rebased_head}:refs/heads/main",
+                    f"--force-with-lease=refs/heads/main:{origin_head}",
+                ],
+                cwd,
+                network=True,
+            )
+            if pushed.returncode != 0:
+                print(f"✗ Rebased fork was not pushed: {_git_failure_detail(pushed)}")
+                print("  The live checkout and remote fork were not changed.")
+                raise SystemExit(1)
+
+            # Push does not update remote-tracking refs consistently across Git versions.
+            # Move it only after the lease-protected remote update succeeded, so the caller's
+            # ordinary ff-only pull advances the live checkout and runs every later stage.
+            tracked = _git_run(
+                git_cmd,
+                ["update-ref", "refs/remotes/origin/main", rebased_head, origin_head],
+                cwd,
+            )
+            if tracked.returncode != 0:
+                current = _git_stdout(git_cmd, ["rev-parse", "origin/main"], cwd)
+                if current != rebased_head:
+                    print("✗ Fork was rebased remotely, but the local tracking ref could not be updated.")
+                    print("  Re-run `hermes update`; the remote fork is safe.")
+                    raise SystemExit(1)
+        finally:
+            removed = _git_run(git_cmd, ["worktree", "remove", "--force", str(checkout)], cwd)
+            if removed.returncode != 0:
+                _git_run(git_cmd, ["worktree", "prune"], cwd)
+    print("  ✓ Personal fork rebased and synced")
+
+
 def _offer_upstream_remote(git_cmd: list[str], cwd: Path, *, assume_yes: bool, input_fn) -> bool:
     """Prompt to add ``upstream`` and add it; False when the user declined, the run is non-interactive, or add failed.
 
@@ -290,10 +383,17 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: 
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return False
     if origin_ahead > 0:
+        if upstream_ahead == 0:
+            print(f"  ✓ Fork is current with upstream and carries {origin_ahead} personal commit(s)")
+            return True
+        if _configured_fork_sync_strategy() == "rebase":
+            _rebase_fork_main_onto_upstream(git_cmd, cwd)
+            return True
         print(
             f"\nℹ Your fork has {origin_ahead} commit(s) not on upstream.\n"
             "  Skipping upstream sync to preserve your changes.\n"
-            "  If you want to merge upstream changes, run:\n    git pull upstream main"
+            "  Set updates.fork_sync_strategy to rebase if Hermes should maintain them on upstream/main.\n"
+            "  Otherwise merge upstream manually with:\n    git pull upstream main"
         )
         return True
     if upstream_ahead == 0:

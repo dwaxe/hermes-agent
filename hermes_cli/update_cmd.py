@@ -91,7 +91,7 @@ from hermes_cli.update_cmd_git import (  # noqa: F401
     _ORPHAN_RESCUE_REF_MAX_AGE_DAYS, _add_upstream_remote, _assess_parked_branch_switch,
     _branch_head_label, _branch_head_suffix, _classify_fetch_failure, _count_commits_between,
     _discard_lockfile_churn, _ensure_non_trampoline_git, _get_origin_url, _git_is_trampoline,
-    _has_upstream_remote, _is_fork, _locate_real_git, _mark_skip_upstream_prompt,
+    _git_stdout, _has_upstream_remote, _is_fork, _locate_real_git, _mark_skip_upstream_prompt,
     _normalize_managed_eol, _portable_git_candidates, _print_fetch_failure,
     _print_parked_branch_kept_notice, _print_parked_branch_skip_warning,
     _prune_orphan_rescue_refs, _should_skip_upstream_prompt, _sync_fork_with_upstream,
@@ -941,13 +941,28 @@ def _prepare_checkout_for_update(
     upstream_checked = True
     if commit_count == 0 and is_fork and branch == "main":
         pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+        pre_sync_origin_sha = _git_stdout(
+            git_cmd, ["rev-parse", f"origin/{branch}"], _m().PROJECT_ROOT)
         upstream_checked = _m()._sync_with_upstream_if_needed(
             git_cmd, _m().PROJECT_ROOT, assume_yes=assume_yes, input_fn=gw_input_fn)
         post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+        post_sync_origin_sha = _git_stdout(
+            git_cmd, ["rev-parse", f"origin/{branch}"], _m().PROJECT_ROOT)
         if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
             synced_count = _count_commits_between(
                 git_cmd, _m().PROJECT_ROOT, pre_sync_sha, post_sync_sha)
             # HEAD moving is proof of an update even if the count can't be read.
+            commit_count = max(1, synced_count)
+        elif (
+            pre_sync_origin_sha
+            and post_sync_origin_sha
+            and pre_sync_origin_sha != post_sync_origin_sha
+        ):
+            # An isolated fork rebase deliberately moves origin/main before the live
+            # checkout. Route through the normal pull/reset, syntax, dependency, and
+            # restart pipeline instead of incorrectly taking the no-update path.
+            synced_count = _count_commits_between(
+                git_cmd, _m().PROJECT_ROOT, pre_sync_origin_sha, post_sync_origin_sha)
             commit_count = max(1, synced_count)
 
     return _CheckoutPlan(

@@ -68,6 +68,15 @@ If the source checkout was left sitting on a feature branch (by tooling, a workt
 
 If you *deliberately* run a custom branch (local patches maintained on top of main), set `updates.parked_branch_strategy: update_in_place` in `config.yaml`. The update then merges `origin/main` **into** your branch instead of switching away from it — the checkout never moves, your commits survive, and the running code advances. Fast-forward when possible; on divergence a true merge behind a `pre-update-<stamp>` safety tag, stopping cleanly (nothing changed) on conflict. `hermes update --switch-branch` overrides back to the switch path for one run — useful on a deep feature branch that must not accumulate update-driven merge commits.
 
+If `origin` is your fork and `upstream` is the official Hermes repository, the default `updates.fork_sync_strategy: preserve` leaves a fork-only `main` unchanged. Set it to `rebase` to have `hermes update` maintain those personal commits on top of `upstream/main`:
+
+```yaml
+updates:
+  fork_sync_strategy: rebase
+```
+
+Hermes performs that rebase in a disposable worktree and preserves merge topology. It updates the fork with an exact `--force-with-lease` only after the rebase succeeds, so a conflict or concurrently updated fork leaves both the live checkout and remote `main` unchanged.
+
 When the parked branch has **uncommitted changes** (dirty tree), Hermes does **not** touch it. The code update is marked **SKIPPED** with a loud warning naming the branch, how far behind `origin/main` it is, and the exact commands to resolve — instead of pretending the update succeeded. The completion line always shows the actual branch and HEAD (`✓ Update complete! [main @ 30fcf9580]`) so drift is visible at a glance. Set `updates.auto_switch_parked_branch: false` in `config.yaml` to disable the auto-switch entirely (the skip warning still fires).
 
 ### Local changes on non-interactive updates

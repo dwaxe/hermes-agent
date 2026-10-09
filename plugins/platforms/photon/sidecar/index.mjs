@@ -67,6 +67,7 @@ import crypto from "node:crypto";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
 import { chooseSendFormat } from "./send-format.mjs";
+import { normalizePollVote } from "./poll-vote.mjs";
 import {
   classifyProbeRejection,
   createProbeMessageId,
@@ -595,12 +596,7 @@ async function normalizeContent(content) {
   // is how a native iMessage poll's vote streams back — Python turns a
   // selection into the answer that resolves a pending `clarify`.
   if (content.type === "poll_option") {
-    return {
-      type: "poll_option",
-      title: content.option?.title ?? content.title ?? "",
-      selected: content.selected !== false,
-      pollTitle: content.poll?.title ?? null,
-    };
+    return normalizePollVote(content);
   }
   // The poll message itself (its creation) — surfaced for completeness so the
   // agent isn't told "content type not handled" if it sees the echo.

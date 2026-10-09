@@ -91,6 +91,9 @@ CASES = {
         _lanes(python=True, frontend=True, e2e_upgrade=True, e2e_desktop_update=True),
     ),
     "root JS tests → frontend": (["tests-js/product-builders.test.mjs"], _lanes(python=True, frontend=True)),
+    "Photon sidecar → JS contract tests": (
+        ["plugins/platforms/photon/sidecar/poll-vote.mjs"], _lanes(python=True, frontend=True),
+    ),
     "docs-only → nothing heavy": (["README.md", "docs/guide.md"], _lanes()),
     "python source → python": (["run_agent.py"], _lanes(python=True, scan=True)),
     # pyproject.toml declares the pytest markers the OS lanes select on, so it

@@ -1456,7 +1456,7 @@ class TurnRunner:
         """Send the approval request from the agent thread: the adapter's interactive button
         approvals (``send_exec_approval``) when available, else plain text with ``/approve`` steps."""
         from gateway.run import _approval_send_outcome, _format_exec_approval_fallback, _interim_metadata, _redact_approval_command
-        from gateway.run_turn_runner_approval_settle import register_timeout_notice
+        from gateway.run_turn_runner_approval_settle import approval_prompt_metadata, register_timeout_notice
         ctx = self._ctx
         adapter = ctx._status_adapter
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
@@ -1474,7 +1474,7 @@ class TurnRunner:
                 fut = self._schedule(
                     adapter.send_exec_approval(
                         chat_id=ctx._status_chat_id, command=cmd, session_key=ctx.session_key or "",
-                        description=desc, metadata=ctx._status_thread_metadata, **flags,
+                        description=desc, metadata=approval_prompt_metadata(ctx, approval_data), **flags,
                     ),
                     "send_exec_approval scheduling error",
                 )

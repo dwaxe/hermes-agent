@@ -9,6 +9,7 @@ import logging
 from contextlib import nullcontext, suppress
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 from typing import Optional
@@ -333,6 +334,105 @@ def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
     return _git_ok(git_cmd, ["push", "origin", "main", "--force-with-lease"], cwd, network=True)
 
 
+def _configured_fork_sync_strategy() -> str:
+    from hermes_cli.update_cmd import _updates_config
+
+    strategy = str(_updates_config().get("fork_sync_strategy", "preserve")).strip().lower()
+    return "rebase" if strategy == "rebase" else "preserve"
+
+
+def _fork_sync_policy(is_fork: bool, branch: str, commit_count: int) -> tuple[str, bool]:
+    if not is_fork or branch != "main":
+        return "preserve", False
+    strategy = _configured_fork_sync_strategy()
+    return strategy, commit_count == 0 or strategy == "rebase"
+
+
+def _fork_sync_update_count(git_cmd, cwd, old_origin, head, commit_count, *, moved_from_sha=None):
+    """A remote-only rebase must reach completion even when ancestry counts are zero."""
+    from hermes_cli.update_cmd import _count_commits_between
+
+    origin = _git_stdout(git_cmd, ["rev-parse", "refs/remotes/origin/main"], cwd)
+    if old_origin and origin and old_origin != origin:
+        if origin == head:
+            # Publishing already-running code owes no move; an earlier checkout move still owes completion.
+            return commit_count if moved_from_sha and moved_from_sha != head else 0
+        return max(1, commit_count, _count_commits_between(git_cmd, cwd, head, origin))
+    return commit_count
+
+
+def _prefetch_fork_rebase(git_cmd, cwd, origin: str, upstream: str) -> None:
+    """Materialize replay blobs without donating the checkout lock to credential helpers."""
+    from hermes_cli.update_custody import run_git
+    from hermes_cli.update_cmd import _no_prompt_git_kwargs, NETWORK_GIT_TIMEOUT_SECONDS
+
+    commits = _git_stdout(git_cmd, ["rev-list", "--reverse", "--no-merges", f"{upstream}..{origin}"], cwd)
+    if commits is None:
+        raise SystemExit("Could not enumerate personal commits; fork unchanged")
+    reads = [["diff", "HEAD", origin], ["diff", origin, upstream]]
+    reads.extend(["show", "--format=", commit] for commit in commits.splitlines())
+    for command in reads:
+        run_git(git_cmd, [*command, "--binary", "--no-ext-diff", "--no-textconv"], cwd=cwd,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, check=True,
+                timeout=NETWORK_GIT_TIMEOUT_SECONDS, **_no_prompt_git_kwargs())
+
+
+def _check_fork_merge_resolutions(git_cmd, cwd, origin: str, upstream: str) -> None:
+    """Rebase recreates merges and would silently drop manual amendments or resolutions."""
+    from hermes_cli.update_cmd import _git_run
+
+    merges = _git_stdout(git_cmd, ["rev-list", "--min-parents=2", "--parents", f"{upstream}..{origin}"], cwd)
+    if merges is None:
+        raise SystemExit("Could not inspect personal merges; fork unchanged")
+    for row in merges.splitlines():
+        commit, *parents = row.split()
+        if len(parents) != 2:
+            raise SystemExit("Personal octopus merge needs manual rebasing; fork unchanged")
+        delta = _git_run(git_cmd, ["show", "--remerge-diff", "--format=", "--no-ext-diff",
+                                   "--no-textconv", commit], cwd, network=True)
+        if delta.returncode != 0 or delta.stdout.strip():
+            raise SystemExit(f"Personal merge {commit[:10]} needs manual rebasing to preserve its resolutions")
+
+
+def _rebase_fork_main_onto_upstream(git_cmd, cwd: Path, origin: str, upstream: str) -> None:
+    """Publish an isolated rebase; the normal pull owns moving and completing the live tree."""
+    from hermes_cli.update_cmd import _git_run, _UPDATE_CRITICAL_FILES
+    from hermes_cli import update_cmd_commit as _commit
+
+    _prefetch_fork_rebase(git_cmd, cwd, origin, upstream)
+    _check_fork_merge_resolutions(git_cmd, cwd, origin, upstream)
+    print("\n→ Rebasing personal fork commits onto upstream/main...")
+    with tempfile.TemporaryDirectory(prefix="hermes-fork-rebase-") as directory:
+        checkout = Path(directory) / "checkout"
+        added = _git_run(git_cmd, ["worktree", "add", "--detach", str(checkout), origin], cwd)
+        if added.returncode != 0:
+            raise SystemExit(f"Could not create the rebase worktree: {added.stderr.strip()}")
+        try:
+            rebased = _git_run(git_cmd, ["-c", "core.editor=true", "-c", "sequence.editor=true",
+                                       "rebase", "--rebase-merges", "--reapply-cherry-picks", "--empty=keep",
+                                       upstream], checkout)
+            if rebased.returncode != 0:
+                raise SystemExit("Personal commits conflict with upstream; live checkout and fork unchanged")
+            target = _git_stdout(git_cmd, ["rev-parse", "HEAD"], checkout)
+            if not target:
+                raise SystemExit("Could not resolve the rebased commit; nothing pushed")
+            if broken := _commit.target_syntax_error(git_cmd, checkout, target, _UPDATE_CRITICAL_FILES):
+                raise UpstreamTargetBroken(target, *broken)
+            pushed = _git_run(git_cmd, ["push", "origin", f"{target}:refs/heads/main",
+                                      f"--force-with-lease=refs/heads/main:{origin}"], cwd, network=True)
+            if pushed.returncode != 0:
+                raise SystemExit("Rebased fork push failed; live checkout unchanged. Re-run hermes update")
+            tracked = _git_run(git_cmd, ["update-ref", "refs/remotes/origin/main", target, origin], cwd)
+            if tracked.returncode != 0 and _git_stdout(
+                    git_cmd, ["rev-parse", "refs/remotes/origin/main"], cwd) != target:
+                raise SystemExit("Fork rebased remotely; tracking ref changed. Re-run hermes update")
+        finally:
+            removed = _git_run(git_cmd, ["worktree", "remove", "--force", str(checkout)], cwd)
+            if removed.returncode != 0:
+                print(f"  ⚠ Could not remove the temporary rebase worktree: {checkout}")
+    print("  ✓ Personal fork rebased and synced")
+
+
 def _offer_upstream_remote(git_cmd: list[str], cwd: Path, *, assume_yes: bool, input_fn) -> bool:
     """Prompt to add ``upstream`` and add it; False when the user declined, the run is non-interactive, or add failed.
 
@@ -374,7 +474,7 @@ class UpstreamTargetBroken(Exception):
 
 
 def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: bool = False, input_fn=None,
-                                  checkout_move=None) -> bool:
+                                  checkout_move=None, fork_sync_strategy=None) -> bool:
     """Offer to add ``upstream``, compare origin/main vs upstream/main, ff-pull when strictly behind, then push origin.
 
     Returns True only when origin/main was actually verified against upstream/main; False when the check never
@@ -403,20 +503,25 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: 
     # One commit for the whole sync (m2): the short `upstream/main` also names a local branch of
     # that name, so the count and the merge could each see a different commit.
     upstream = _git_stdout(git_cmd, ["rev-parse", "-q", "--verify", "refs/remotes/upstream/main^{commit}"], cwd)
-    origin_ahead = _count_commits_between(git_cmd, cwd, upstream, "refs/remotes/origin/main") if upstream else -1
-    upstream_ahead = _count_commits_between(git_cmd, cwd, "refs/remotes/origin/main", upstream) if upstream else -1
+    origin = _git_stdout(git_cmd, ["rev-parse", "-q", "--verify", "refs/remotes/origin/main^{commit}"], cwd)
+    origin_ahead = _count_commits_between(git_cmd, cwd, upstream, origin) if upstream and origin else -1
+    upstream_ahead = _count_commits_between(git_cmd, cwd, origin, upstream) if upstream and origin else -1
     if origin_ahead < 0 or upstream_ahead < 0:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return False
+    if upstream_ahead == 0:
+        print("  ✓ Fork is up to date with upstream")
+        return True
+    strategy = fork_sync_strategy or _configured_fork_sync_strategy()
+    if strategy == "rebase":
+        _rebase_fork_main_onto_upstream(git_cmd, cwd, origin, upstream)
+        return True
     if origin_ahead > 0:
         print(
             f"\nℹ Your fork has {origin_ahead} commit(s) not on upstream.\n"
             "  Skipping upstream sync to preserve your changes.\n"
-            "  If you want to merge upstream changes, run:\n    git pull upstream main"
+            "  Set updates.fork_sync_strategy to rebase to replay them onto upstream/main."
         )
-        return True
-    if upstream_ahead == 0:
-        print("  ✓ Fork is up to date with upstream")
         return True
     print(f"\n→ Fork is {upstream_ahead} commit(s) behind upstream\n→ Pulling from upstream...")
     # A tree move like the pull itself: the marker and the owed tail are armed before git writes,

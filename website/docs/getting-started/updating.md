@@ -88,6 +88,17 @@ hermes config set updates.check false
 
 This suppresses both cached update notices and passive update-check network requests. The default is `true`. Explicit `hermes update --check` and `hermes update` still work; this setting does not control the Desktop application's updater.
 
+### Updating a personal fork
+
+Forks preserve personal commits by default. To have `hermes update` replay them onto
+the latest upstream `main`, set `updates.fork_sync_strategy: rebase` in `config.yaml`.
+Hermes rebases in a temporary checkout, checks startup syntax, and publishes with an
+exact force-with-lease before running the normal update stages. Conflicts or a
+rejected lease leave the live checkout unchanged. Merge history and commits whose
+patches already appear upstream are retained. Merges with manual amendments or conflict
+resolutions require a manual rebase, so those changes cannot disappear. Remove a local fix only after verifying
+that upstream resolves its original issue.
+
 ### What happens during an update
 
 For an admitted source checkout, `hermes update` runs these phases:

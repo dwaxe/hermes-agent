@@ -98,6 +98,7 @@ from hermes_cli.update_cmd_git import (
     _ORPHAN_RESCUE_REF_MAX_AGE_DAYS, _add_upstream_remote, _assess_parked_branch_switch,
     _branch_head_label, _branch_head_suffix, _classify_fetch_failure, _count_commits_between,
     _discard_lockfile_churn, _ensure_non_trampoline_git, _get_origin_url, _git_is_trampoline,
+    _fork_sync_policy, _fork_sync_update_count, _git_stdout,
     _has_upstream_remote, _is_fork, _locate_real_git, _mark_skip_upstream_prompt,
     _normalize_managed_eol, _park_detached_head, _portable_git_candidates, _print_fetch_failure,
     _print_parked_branch_kept_notice, _print_parked_branch_skip_warning,
@@ -1158,7 +1159,7 @@ def _pull_updates(
             try:
                 _m()._sync_with_upstream_if_needed(
                     git_cmd, _m().PROJECT_ROOT, assume_yes=assume_yes, input_fn=gw_input_fn,
-                    checkout_move=_moves_for(_windows_gateway_resume))
+                    checkout_move=_moves_for(_windows_gateway_resume), fork_sync_strategy="preserve")
             except UpstreamTargetBroken as broken:  # refused before its move: the update rolls back
                 _verify_head_after_pull(  # never reset an unexpected branch's ref onto pre
                     git_cmd, branch, movement_baseline, in_place_update=in_place_update,
@@ -1330,6 +1331,7 @@ class _CheckoutPlan:
     rollback_branch: str | None = None
     # The switch changed the running code with no new commits to count (commit_count == -1).
     switched_without_new_commits: bool = False
+    fork_sync_strategy: str = "preserve"
 
 
 def _apply_parked_branch_guard(
@@ -1456,22 +1458,16 @@ def _prepare_checkout_for_update(
             commit_count = -1
             switched_without_new_commits = True
 
-    # A fork can match origin yet trail upstream, so the sync can move HEAD with
-    # commit_count == 0; detect that BEFORE the no-update return so deps, restarts AND the
-    # fleet matrix still run (it used to live in the early-return branch and verified nothing).
-    # The sync can therefore advance HEAD even though the origin comparison found no commits. Detect that
-    # BEFORE taking the no-update return so dependency refreshes, gateway restarts, AND the fleet version
-    # matrix still run for the pulled code (#73108 — previously the sync lived inside the commit_count == 0
-    # branch, which returns immediately after: an update that pulled hundreds of upstream commits printed
-    # "Already up to date!" and verified nothing). Non-fork checkouts have no upstream question: origin IS
-    # the official repo, so "Already up to date!" is fully verified there.
+    # Rebase origin before pulling; a remote-only move must still run completion.
+    fork_sync_strategy, sync_before_pull = _fork_sync_policy(is_fork, branch, commit_count)
     upstream_checked = True
-    if commit_count == 0 and is_fork and branch == "main" and not release_tag:
+    if sync_before_pull:
         pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+        pre_sync_origin = _git_stdout(git_cmd, ["rev-parse", "refs/remotes/origin/main"], _m().PROJECT_ROOT)
         try:
             upstream_checked = _m()._sync_with_upstream_if_needed(
                 git_cmd, _m().PROJECT_ROOT, assume_yes=assume_yes, input_fn=gw_input_fn,
-                checkout_move=_moves_for(_windows_gateway_resume))
+                checkout_move=_moves_for(_windows_gateway_resume), fork_sync_strategy=fork_sync_strategy)
         except UpstreamTargetBroken as broken:  # nothing moved; local edits stay parked, like a rollback
             if auto_stash_ref is not None:
                 print(f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})")
@@ -1488,13 +1484,16 @@ def _prepare_checkout_for_update(
             # HEAD moving is proof of an update even if the count can't be read.
             commit_count = max(1, synced_count)
             moved_from_sha = moved_from_sha or pre_sync_sha
+        commit_count = _fork_sync_update_count(
+            git_cmd, _m().PROJECT_ROOT, pre_sync_origin, post_sync_sha, commit_count,
+            moved_from_sha=moved_from_sha)
 
     return _CheckoutPlan(
         auto_stash_ref=auto_stash_ref, commit_count=commit_count, in_place_update=in_place_update,
         parked_branch_switched=parked_branch_switched, prompt_for_restore=prompt_for_restore,
         switch_block_reason=switch_block_reason, upstream_checked=upstream_checked,
         pre_sync_sha=moved_from_sha, rollback_branch=rollback_branch,
-        switched_without_new_commits=switched_without_new_commits)
+        switched_without_new_commits=switched_without_new_commits, fork_sync_strategy=fork_sync_strategy)
 
 
 @dataclass
@@ -1979,7 +1978,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
             gw_input_fn=gw_input_fn, discard_local_changes=opts.discard_local_changes,
             keep_stash=opts.keep_stash, target_ref=target_ref, pre_sync_sha=_plan.pre_sync_sha,
             rollback_branch=_plan.rollback_branch,
-            sync_upstream=is_fork and branch == "main" and not release_sha, assume_yes=assume_yes,
+            sync_upstream=is_fork and branch == "main" and not release_sha
+            and _plan.fork_sync_strategy != "rebase", assume_yes=assume_yes,
             in_place_update=_plan.in_place_update, _windows_gateway_resume=_windows_gateway_resume,
             expected_sha=completion_request.get("expected_sha"))
         _apply_pulled_update(

@@ -372,6 +372,16 @@ Plugins that load after the adapters connected (install/enable from the CLI, Des
 - **Scope limit** — handlers only. Tools and system-prompt sections of a late plugin wait for the next
   session (prompt-cache invariant); portable MCP servers wait for `mcp.reload`. Nothing un-wires on disable.
 
+## Safe native approval diagnostics
+
+On POSIX, the local control socket exposes `approval-probe-start` with an existing `session_key` and
+`approval-probe-status` with the returned `test_id`. The probe requires the current profile's
+authorized home-user DM and a native approval adapter. It creates a real pending request for
+`true`, offers Allow Once and Deny, and records the vote without executing a command or saving
+permission. Status includes the exact request and native message IDs; results contain no recipient
+identifiers. Only one probe may be pending, and the normal approval timeout and shutdown withdrawal
+apply. Native send failure ends the probe without a text fallback.
+
 ## Related Docs
 
 - [Session Storage](./session-storage.md)

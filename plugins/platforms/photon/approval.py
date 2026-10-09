@@ -21,7 +21,7 @@ class _ApprovalPoll:
 
 
 def poll_message_id(event: dict) -> str | None:
-    """Spectrum 12.7 vote IDs are GUID:sender:option:action:epoch-ms.
+    """Spectrum vote IDs are GUID:sender:option:action:epoch-ms[:seq:n].
 
     The poll object has no ID; use the SDK's envelope identity, never its title.
     GUIDs may contain colons, so split at the sender delimiter from the right.
@@ -32,6 +32,10 @@ def poll_message_id(event: dict) -> str | None:
         return None
     guid, separator, suffix = message_id.rpartition(f":{sender}:")
     parts = suffix.rsplit(":", 2)
+    if len(parts) == 3 and parts[1] == "seq":
+        if not parts[2].isascii() or not parts[2].isdigit():
+            return None
+        parts = parts[0].rsplit(":", 2)
     if not separator or not guid or len(parts) != 3 or not parts[0]:
         return None
     if parts[1] not in {"selected", "deselected"} or not parts[2].isdigit():

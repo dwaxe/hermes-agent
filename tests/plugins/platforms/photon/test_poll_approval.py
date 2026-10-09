@@ -91,6 +91,55 @@ def test_runner_poll_and_vote_resolve_exact_request(setup, choice, title):
     adapter.handle_message.assert_not_called()
 
 
+@pytest.mark.parametrize("suffix,valid", [
+    (":option:selected:42", True),
+    (":option:selected:42:seq:0", True),
+    (":option:with:colons:deselected:42:seq:17", True),
+    (":option:selected:42:seq", False),
+    (":option:selected:42:seq:", False),
+    (":option:selected:42:seq:-1", False),
+    (":option:selected:42:seq:nope", False),
+    (":option:selected:42:seq:²", False),
+    (":option:selected:42:seq:17:trailing", False),
+    (":option:unknown:42:seq:17", False),
+    (":option:selected:unknown:seq:17", False),
+])
+def test_poll_message_id_accepts_only_optional_unsigned_sequence(suffix, valid):
+    from plugins.platforms.photon.approval import poll_message_id
+
+    poll, sender = "iMessage:poll:with:colons", "requester:with:colons"
+    event = {"messageId": f"{poll}:{sender}{suffix}", "sender": {"id": sender}}
+    assert poll_message_id(event) == (poll if valid else None)
+
+
+def test_sequenced_votes_preserve_bound_and_single_use_approval(setup):
+    adapter, entry = setup
+    sibling = _ApprovalEntry({**DATA, "command": "rm -rf /tmp/other"})
+    approval._gateway_queues[SESSION].insert(0, sibling)
+    send(adapter, entry)
+
+    def sequenced(sequence=42, **changes):
+        event = vote(**changes)
+        event["messageId"] += f":seq:{sequence}"
+        return event
+
+    for event in [sequenced(sender=OTHER), sequenced(chat=OTHER),
+                  sequenced(poll="another-poll"), sequenced(selected=False),
+                  sequenced(selected="true"), sequenced(sequence=-1),
+                  sequenced(sequence="")]:
+        asyncio.run(adapter._dispatch_inbound(event))
+        assert entry.result is None and not entry.event.is_set()
+
+    accepted = sequenced(sequence=0)
+    asyncio.run(adapter._dispatch_inbound(accepted))
+    assert entry.result == "once" and entry.event.is_set()
+    assert sibling.result is None and not sibling.event.is_set()
+    for event in [accepted, sequenced(title="Always Allow"), sequenced(selected=False)]:
+        asyncio.run(adapter._dispatch_inbound(event))
+    assert entry.result == "once" and sibling.result is None
+    adapter.handle_message.assert_not_called()
+
+
 @pytest.mark.parametrize("change", [
     {"sender": OTHER}, {"chat": OTHER}, {"poll": "another-poll"},
     {"title": "/approve always"}, {"title": "unknown"}, {"selected": False},

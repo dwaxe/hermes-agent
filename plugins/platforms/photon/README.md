@@ -213,4 +213,19 @@ deliberate:
    and an agent reply into a group right after a gateway restart (exercises
    `space.get` rehydration).
 
+### Approval polls
+
+Command approvals use native iMessage polls with the existing Allow Once,
+Allow Session, Always Allow, and Deny choices, restricted by the request's
+policy. Only the original requester in the original chat can vote, and the
+sender must still pass the gateway authorization check. Each poll targets one
+exact pending request; replayed votes, expired polls, and withdrawn requests
+cannot approve another command. Allow Once remains single-use.
+
+If poll delivery fails, the sidecar does not return a poll message ID, or the
+request cannot be safely bound, Hermes sends the existing `/approve` and
+`/deny` text prompt. Votes on unrelated polls cannot answer pending approvals.
+The vote correlation uses Spectrum 12.7's event ID format; verify it alongside
+the poll roundtrip when upgrading the SDK.
+
 [photon]: https://photon.codes/

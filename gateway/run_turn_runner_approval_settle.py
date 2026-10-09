@@ -82,3 +82,10 @@ async def _edit_card(adapter, chat_id: str, message_id: str, content: str) -> bo
         logger.debug("Approval card edit failed; sending the notice as a new message", exc_info=True)
         return False
     return bool(getattr(result, "success", False))
+
+
+def approval_prompt_metadata(ctx, approval_data: dict) -> dict:
+    """Bind interactive prompts to their originating request and approver."""
+    return {**(ctx._status_thread_metadata or {}),
+            "approval_request_id": approval_data.get("request_id"),
+            "requester_user_id": getattr(getattr(ctx, "source", None), "user_id", None)}

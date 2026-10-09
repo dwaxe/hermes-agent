@@ -46,6 +46,7 @@ from gateway.platforms.helpers import compile_mention_patterns, strip_markdown
 from gateway.platforms.helpers import MessageDeduplicator, bounded_put, cancel_task
 from utils import atomic_json_write
 
+from .approval import PhotonApprovalMixin
 from .auth import load_project_credentials
 # Sidecar dir resolution is lazy (never at import): it probes the filesystem and may
 # mirror files. Tests monkeypatch sidecar_paths._SIDECAR_DIR.
@@ -555,7 +556,7 @@ def _guess_mime(path: str) -> Optional[str]:
 
 # -- Adapter -------------------------------------------------------------------
 
-class PhotonAdapter(BasePlatformAdapter):
+class PhotonAdapter(PhotonApprovalMixin, BasePlatformAdapter):
     """Bidirectional bridge to Photon Spectrum via the Node spectrum-ts sidecar."""
 
     MAX_MESSAGE_LENGTH = _MAX_MESSAGE_LENGTH
@@ -893,6 +894,8 @@ class PhotonAdapter(BasePlatformAdapter):
         # gate: reacting to a non-wake-word group message is valid.
         self._record_last_inbound(space_id, message_id)
         if ctype == "poll_option":
+            if self._handle_approval_vote(event):
+                return
             # Native poll vote: a selection is forwarded as if typed (the gateway's
             # pending-clarify intercept resolves it); a deselection is dropped.
             if content.get("selected") is False:
@@ -902,7 +905,13 @@ class PhotonAdapter(BasePlatformAdapter):
             if not choice:
                 logger.debug("[photon] ignoring poll vote with empty title")
                 return
-            await self.handle_message(_event(choice))
+            from tools.approval import has_blocking_approval
+            vote = _event(choice)
+            # Unassociated polls must never become approval/control commands or
+            # answer a different pending approval through the typed-text path.
+            if choice.startswith("/") or has_blocking_approval(self._source_session_key(vote.source)):
+                return
+            await self.handle_message(vote)
             return
         # Mention gate BEFORE normalising: _normalize_content persists inline attachment
         # bytes to the media cache, and a dropped group message must not leave files behind.

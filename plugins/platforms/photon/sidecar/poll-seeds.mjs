@@ -18,6 +18,10 @@ function trim(map, limit) {
 }
 
 export class PollSeedStore {
+  #loadFailed = false;
+  #pendingPolls = new Map();
+  #pendingSentPollIds = new Map();
+
   constructor(file = null, limit = 200) {
     this.file = nonempty(file);
     this.limit = limit;
@@ -26,6 +30,7 @@ export class PollSeedStore {
   }
 
   load() {
+    this.#loadFailed = false;
     if (!this.file) return this;
     let saved, fd;
     try {
@@ -38,6 +43,7 @@ export class PollSeedStore {
       saved = JSON.parse(bytes.subarray(0, length).toString("utf8"));
     } catch (err) {
       if (err?.code !== "ENOENT") {
+        this.#loadFailed = true;
         console.error(`photon-sidecar: WARNING ignoring unreadable poll seed file: ${err?.message || err}`);
       }
       return this;
@@ -86,15 +92,26 @@ export class PollSeedStore {
     this.sentPollIds.set(id, true);
     if (known.some((option) => nonempty(option.optionIdentifier))) {
       this.polls.delete(id);
-      this.polls.set(id, { title: nonempty(title) ?? "", options: known });
+      const seed = { title: nonempty(title) ?? "", options: known };
+      this.polls.set(id, seed);
+      if (this.file) {
+        this.#pendingPolls.delete(id);
+        this.#pendingPolls.set(id, seed);
+      }
+    }
+    if (this.file) {
+      this.#pendingSentPollIds.delete(id);
+      this.#pendingSentPollIds.set(id, true);
     }
     this.#trim();
-    this.#save(id);
+    this.#save();
   }
 
   #trim() {
     trim(this.polls, this.limit);
     trim(this.sentPollIds, SENT_POLL_LIMIT);
+    trim(this.#pendingPolls, this.limit);
+    trim(this.#pendingSentPollIds, SENT_POLL_LIMIT);
   }
 
   #lock() {
@@ -121,7 +138,7 @@ export class PollSeedStore {
   }
 
   // Serialize merge + rename across processes so two sidecars cannot lose a send.
-  #save(id) {
+  #save() {
     if (!this.file) return;
     const temp = `${this.file}.${process.pid}.${randomUUID()}.tmp`;
     let lock;
@@ -129,22 +146,30 @@ export class PollSeedStore {
       fs.mkdirSync(path.dirname(this.file), { recursive: true });
       lock = this.#lock();
       const disk = new PollSeedStore(this.file, this.limit).load();
-      const newest = this.polls.get(id);
-      this.polls = new Map([...disk.polls, ...[...this.polls].filter(([pollId]) => !disk.polls.has(pollId))]);
-      this.sentPollIds = new Map([...disk.sentPollIds, ...this.sentPollIds]);
-      if (newest) {
-        this.polls.delete(id);
-        this.polls.set(id, newest);
+      if (disk.#loadFailed) {
+        disk.polls = new Map(this.polls);
+        disk.sentPollIds = new Map(this.sentPollIds);
       }
-      this.sentPollIds.delete(id);
-      this.sentPollIds.set(id, true);
-      this.#trim();
-      const polls = [...this.polls].map(([pollId, seed]) => ({ id: pollId, ...seed }));
-      const saved = JSON.stringify({ version: 1, polls, sentPollIds: [...this.sentPollIds.keys()] });
+      // Cached rows may already be evicted on disk; merge only unsaved sends.
+      for (const [id, seed] of this.#pendingPolls) {
+        disk.polls.delete(id);
+        disk.polls.set(id, seed);
+      }
+      for (const id of this.#pendingSentPollIds.keys()) {
+        disk.sentPollIds.delete(id);
+        disk.sentPollIds.set(id, true);
+      }
+      disk.#trim();
+      const polls = [...disk.polls].map(([pollId, seed]) => ({ id: pollId, ...seed }));
+      const saved = JSON.stringify({ version: 1, polls, sentPollIds: [...disk.sentPollIds.keys()] });
       if (Buffer.byteLength(saved) > MAX_SEED_BYTES) throw new Error("oversized poll seeds to save");
       fs.writeFileSync(temp, saved, { encoding: "utf8", flag: "wx", mode: 0o600 });
       fs.renameSync(temp, this.file);
       fs.chmodSync(this.file, 0o600);
+      this.polls = disk.polls;
+      this.sentPollIds = disk.sentPollIds;
+      this.#pendingPolls.clear();
+      this.#pendingSentPollIds.clear();
     } catch (err) {
       console.error(`photon-sidecar: WARNING could not save poll seeds: ${err?.message || err}`);
     } finally {

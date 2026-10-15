@@ -21,6 +21,7 @@ from gateway.session_identity import RoutingIdentity
 from hermes_cli.config import atomic_config_write
 from hermes_constants import get_hermes_home
 from plugins.platforms.photon.adapter import PhotonAdapter
+from tests.waiting import async_wait_until
 from tools import approval
 from tools.approval_gateway_wait import _ApprovalEntry
 
@@ -90,14 +91,15 @@ async def probe_env(tmp_path, monkeypatch):
     )
     env = SimpleNamespace(home=home, runner=runner, adapter=adapter, source=source, sent=sent)
     yield env
-    async def finish_probes():
-        while getattr(runner, "_approval_probe_tasks", set()):
-            for key in list(approval._gateway_queues):
-                if key.startswith("approval-probe:"):
-                    approval.resolve_gateway_approval(key, "deny", resolve_all=True)
-            await asyncio.sleep(0.01)
+    def finish_probes():
+        if not getattr(runner, "_approval_probe_tasks", set()):
+            return True
+        for key in list(approval._gateway_queues):
+            if key.startswith("approval-probe:"):
+                approval.resolve_gateway_approval(key, "deny", resolve_all=True)
+        return False
 
-    await asyncio.wait_for(finish_probes(), timeout=5)
+    await async_wait_until(finish_probes, timeout=5, what="approval probe tasks to finish")
     await asyncio.to_thread(runner._executor.shutdown, wait=True, cancel_futures=True)
 
 
@@ -110,16 +112,15 @@ async def _start(env, **params):
 async def _status(env, test_id, expected):
     from gateway.run_approval_probe import _probe_status
 
-    async def wait():
-        while True:
-            result = _probe_status(env.runner, {"test_id": test_id})
-            if result["status"] == expected:
-                return result
-            if result["status"] not in {"pending", "waiting"}:
-                raise AssertionError(f"Unexpected approval probe outcome: {result}")
-            await asyncio.sleep(0.01)
+    def matching_status():
+        result = _probe_status(env.runner, {"test_id": test_id})
+        if result["status"] == expected:
+            return result
+        if result["status"] not in {"pending", "waiting"}:
+            raise AssertionError(f"Unexpected approval probe outcome: {result}")
+        return None
 
-    return await asyncio.wait_for(wait(), timeout=5)
+    return await async_wait_until(matching_status, timeout=5, what=f"approval probe status {expected}")
 
 
 @pytest.mark.asyncio
@@ -318,11 +319,10 @@ async def test_cancelling_during_native_send_prevents_late_response_from_revivin
         assert not approval._gateway_queues
         release.set()
 
-        async def native_finished():
-            while "late-probe-poll" not in getattr(env.adapter, "_approval_polls", {}):
-                await asyncio.sleep(0.01)
-
-        await asyncio.wait_for(native_finished(), timeout=5)
+        await async_wait_until(
+            lambda: "late-probe-poll" in getattr(env.adapter, "_approval_polls", {}),
+            timeout=5, what="cancelled native send to finish",
+        )
         await env.adapter._on_inbound_line(json.dumps(_vote("late-probe-poll")))
         cancelled = await _status(env, result["test_id"], "cancelled")
         assert cancelled["resolved"] is False and cancelled["choice"] is None

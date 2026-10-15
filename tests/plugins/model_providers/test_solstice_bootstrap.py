@@ -28,7 +28,7 @@ print(profile.name)
     result = subprocess.run(
         [sys.executable, "-I", "-S", "-B", "-c", script, str(root)],
         env={**os.environ, "HERMES_HOME": str(tmp_path)},
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=30, check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip() == "solstice"

@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 
 from hermes_cli import doctor, doctor_tools
+from hermes_cli.doctor_report import Finding
 
 
 def test_root_audit_does_not_claim_to_audit_pm_browser(monkeypatch, tmp_path):
@@ -16,11 +17,13 @@ def test_root_audit_does_not_claim_to_audit_pm_browser(monkeypatch, tmp_path):
     audits = []
     monkeypatch.setattr(doctor_tools, "_audit_one", lambda *args: audits.append(args))
 
-    doctor_tools._check_npm_audit(False)
+    finding = doctor_tools._check_npm_audit(False)
+    assert isinstance(finding, Finding)
+    assert finding.manual_issues == []
 
     root_audit = next(audit for audit in audits if audit[3] == ["--workspaces=false"])
     assert root_audit[1] == tmp_path
-    assert root_audit[2] == "Root npm"
+    assert root_audit[2] == "Root npm package"
 
 
 def test_workspace_findings_do_not_dismiss_runtime_dependencies(monkeypatch, capsys):
@@ -33,6 +36,9 @@ def test_workspace_findings_do_not_dismiss_runtime_dependencies(monkeypatch, cap
     doctor_tools._audit_one("npm", "/unused", "ui-tui workspace", ["--workspace", "ui-tui"], issues)
 
     output = capsys.readouterr().out
-    assert "runtime and build tooling" in output
+    assert "runtime and build dependencies" in output
     assert "not runtime" not in output
-    assert issues == ["ui-tui workspace has 1 npm vulnerability"]
+    assert issues == [
+        "ui-tui workspace has 1 npm vulnerability; wait for an upstream lockfile fix, then update "
+        "your installation (Docker: pull a rebuilt image; recreating the same image restores the same dependencies)"
+    ]

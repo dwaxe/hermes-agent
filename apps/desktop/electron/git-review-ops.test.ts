@@ -7,14 +7,7 @@ import path from 'node:path'
 import { simpleGit } from 'simple-git'
 import { afterEach, test, vi } from 'vitest'
 
-import {
-  gitFor,
-  repoStatus,
-  resolveRenamePath,
-  REVIEW_FILE_CAP,
-  reviewCreatePr,
-  reviewList
-} from './git-review-ops'
+import { gitFor, repoStatus, resolveRenamePath, REVIEW_FILE_CAP, reviewCreatePr, reviewList } from './git-review-ops'
 import type * as NoConsoleGit from './no-console-git'
 
 // `runGh` shells to the `gh` CLI via execFile. Mock it so reviewCreatePr's gh
